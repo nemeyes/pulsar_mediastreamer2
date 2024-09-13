@@ -35,6 +35,7 @@ struct _PlayerData {
 	int duration;
 	bool_t swap;
 	bool_t is_raw;
+	int silence_duration_ms;
 
 	mpg123_handle* mpg123;
 	int is_mp3;
@@ -59,6 +60,7 @@ static void mp3_player_init(MSFilter *f) {
 	d->current_pos_bytes = 0; /* excluding wav header */
 	d->duration = 0;
 	d->is_raw = TRUE;
+	d->silence_duration_ms = 0;
  
 	f->data = d;
 }
@@ -244,6 +246,16 @@ static int mp3_player_pause(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	ms_filter_lock(f);
 	if (d->state == MSPlayerPlaying) {
 		d->state = MSPlayerPaused;
+
+		if ( d->silence_duration_ms > 0 ) {  
+			int silence_bytes = silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
+			mblk_t *silence_block = allocb(silence_bytes, 0);
+			memset(silence_block->b_wptr, 0, silence_bytes);   
+			silence_block->b_wptr += silence_bytes;
+			mblk_set_timestamp_info(silence_block, d->ts);
+			ms_queue_put(f->outputs[0], silence_block);  
+		}
+
 	}
 	ms_filter_unlock(f);
 	return 0;
@@ -331,6 +343,16 @@ static void mp3_player_process(MSFilter *f) {
 					freemsg(om);
 				}
 				if (err == MPG123_DONE) {
+
+					if ( d->silence_duration_ms > 0 ) {  
+						int silence_bytes = silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
+						mblk_t *silence_block = allocb(silence_bytes, 0);
+						memset(silence_block->b_wptr, 0, silence_bytes);   
+						silence_block->b_wptr += silence_bytes;
+						mblk_set_timestamp_info(silence_block, d->ts);
+						ms_queue_put(f->outputs[0], silence_block);   
+					}
+
 					ms_warning("MSMP3FilePlayer[%p]: fail to read MP3 data.");
 					d->state = MSPlayerPaused;
 					ms_filter_notify_no_arg(f, MS_PLAYER_EOF);
@@ -401,6 +423,12 @@ static int mp3_player_set_sr(MSFilter *f, void *arg) {
 static int mp3_player_loop(MSFilter *f, void *arg) {	
 	PlayerData *d = (PlayerData *)f->data;
 	d->loop_after = *((int *)arg);
+	return 0;
+}
+
+static int mp3_player_set_silence(MSFilter *f, void *arg) {	
+	PlayerData *d = (PlayerData *)f->data;
+	d->silence_duration_ms= *((int *)arg);
 	return 0;
 }
 
@@ -488,6 +516,7 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                           {MS_PLAYER_SET_LOOP, mp3_player_loop},
                                           {MS_FILTER_GET_OUTPUT_FMT, mp3_player_get_fmtp},
                                           {MS_FILTER_SET_OUTPUT_FMT, mp3_player_set_fmtp},
+										  {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
                                           {0, NULL}};
 
 #ifdef _WIN32
