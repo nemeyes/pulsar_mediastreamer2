@@ -248,7 +248,7 @@ static int mp3_player_pause(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 		d->state = MSPlayerPaused;
 
 		if ( d->silence_duration_ms > 0 ) {  
-			int silence_bytes = silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
+			int silence_bytes = d->silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
 			mblk_t *silence_block = allocb(silence_bytes, 0);
 			memset(silence_block->b_wptr, 0, silence_bytes);   
 			silence_block->b_wptr += silence_bytes;
@@ -345,7 +345,7 @@ static void mp3_player_process(MSFilter *f) {
 				if (err == MPG123_DONE) {
 
 					if ( d->silence_duration_ms > 0 ) {  
-						int silence_bytes = silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
+						int silence_bytes = d->silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
 						mblk_t *silence_block = allocb(silence_bytes, 0);
 						memset(silence_block->b_wptr, 0, silence_bytes);   
 						silence_block->b_wptr += silence_bytes;
