@@ -131,7 +131,7 @@ typedef enum _MSPlayerState MSPlayerState;
 
 #define MS_PLAYER_GET_CURRENT_POSITION MS_FILTER_METHOD(MSFilterPlayerInterface, 8, int)
 
-#define MS_MP3FILE_PLAYER_SET_SILENCE MS_FILTER_METHOD(MSFilterPlayerInterface, 9, int)
+//#define MS_MP3FILE_PLAYER_SET_SILENCE MS_FILTER_METHOD(MSFilterPlayerInterface, 8, int)
 
 #define MS_PLAYER_EOF MS_FILTER_EVENT_NO_ARG(MSFilterPlayerInterface, 0)
 
