@@ -504,10 +504,11 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                           {MS_FILTER_GET_NCHANNELS, mp3_player_get_nch},
                                           {MS_MP3FILE_PLAYER_LOOP, mp3_player_loop},
                                           {MS_MP3FILE_PLAYER_DONE, mp3_player_eof},
+										  {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
                                           {MS_PLAYER_GET_DURATION, mp3_player_get_duration},
                                           {MS_PLAYER_GET_CURRENT_POSITION, mp3_player_get_current_position},
                                           {MS_PLAYER_SEEK_MS, mp3_player_seek_position},
-                                          /* this wav file player implements the MSFilterPlayerInterface*/
+										  /* this wav file player implements the MSFilterPlayerInterface*/
                                           {MS_PLAYER_OPEN, mp3_player_open},
                                           {MS_PLAYER_START, mp3_player_start},
                                           {MS_PLAYER_PAUSE, mp3_player_pause},
@@ -515,8 +516,7 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                           {MS_PLAYER_GET_STATE, mp3_player_get_state},
                                           {MS_PLAYER_SET_LOOP, mp3_player_loop},
                                           {MS_FILTER_GET_OUTPUT_FMT, mp3_player_get_fmtp},
-                                          {MS_FILTER_SET_OUTPUT_FMT, mp3_player_set_fmtp},
-										  {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
+                                          {MS_FILTER_SET_OUTPUT_FMT, mp3_player_set_fmtp},										 
                                           {0, NULL}};
 
 #ifdef _WIN32
