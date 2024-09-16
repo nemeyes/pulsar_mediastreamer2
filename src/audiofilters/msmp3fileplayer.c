@@ -504,7 +504,7 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                         //   {MS_FILTER_GET_NCHANNELS, mp3_player_get_nch},
                                            {MS_MP3FILE_PLAYER_LOOP, mp3_player_loop},
                                            {MS_MP3FILE_PLAYER_DONE, mp3_player_eof},
-										   {MS_FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
+										   {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
                                            {MS_PLAYER_GET_DURATION, mp3_player_get_duration},
                                            {MS_PLAYER_GET_CURRENT_POSITION, mp3_player_get_current_position},
                                            {MS_PLAYER_SEEK_MS, mp3_player_seek_position},

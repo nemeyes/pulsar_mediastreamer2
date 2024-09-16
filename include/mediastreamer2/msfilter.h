@@ -91,6 +91,7 @@ enum _MSFilterInterfaceId {
 	MSFilterVADInterface,           /**<Voice activity detection interface*/
 	MSFilterVoidInterface,          /**<Void source/sink interface*/
 	MSFilterScreenSharingInterface, /**<Screen sharing interface*/
+	MSFilterMP3PlayerInterface,
 };
 
 /**
