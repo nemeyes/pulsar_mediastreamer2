@@ -60,7 +60,7 @@ static void mp3_player_init(MSFilter *f) {
 	d->current_pos_bytes = 0; /* excluding wav header */
 	d->duration = 0;
 	d->is_raw = TRUE;
-	d->silence_duration_ms = 1000;
+	d->silence_duration_ms = 0;
  
 	f->data = d;
 }
