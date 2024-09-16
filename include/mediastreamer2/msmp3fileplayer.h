@@ -4,6 +4,9 @@
 
 #include <mediastreamer2/msfilter.h>
 
+
+extern MSFilterDesc mp3_player_methods;
+
  /*methods*/
 #define MS_MP3FILE_PLAYER_OPEN MS_FILTER_METHOD(MS_MP3FILE_PLAYER_ID, 0, const char *)
 #define MS_MP3FILE_PLAYER_START MS_FILTER_METHOD_NO_ARG(MS_MP3FILE_PLAYER_ID, 1)

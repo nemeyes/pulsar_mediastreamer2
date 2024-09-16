@@ -66,6 +66,7 @@ extern MSFilterDesc ms_aac_eld_enc_desc;
 extern MSFilterDesc ms_aac_eld_dec_desc;
 extern MSFilterDesc ms_opus_dec_desc;
 extern MSFilterDesc ms_opus_enc_desc;
+extern MSFilterDesc ms_mp3file_player_desc;
 // extern MSFilterDesc ms_vt_h264_enc;
 // extern MSFilterDesc ms_vt_h264_dec;
 
@@ -81,4 +82,4 @@ MSFilterDesc *ms_voip_filter_descs[] = {
     //&ms_h264_dec_desc,
     &ms_jpeg_writer_desc, &ms_mire_desc, &ms_ext_display_desc, &ms_iosdisplay_desc, &ms_ioscapture_desc,
     &ms_g722_enc_desc, &ms_g722_dec_desc, &ms_vp8_enc_desc, &ms_vp8_dec_desc, &ms_g722_dec_desc, &ms_l16_enc_desc,
-    &ms_l16_dec_desc, &ms_aac_eld_enc_desc, &ms_aac_eld_dec_desc, &ms_opus_dec_desc, &ms_opus_enc_desc, NULL};
+    &ms_l16_dec_desc, &ms_aac_eld_enc_desc, &ms_aac_eld_dec_desc, &ms_opus_dec_desc, &ms_opus_enc_desc, &ms_mp3file_player_desc, NULL};
