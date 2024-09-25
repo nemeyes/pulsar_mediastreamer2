@@ -168,7 +168,7 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 		//mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
 		// mpg123_format_none(d->mpg123);
 		// mpg123_format(d->mpg123, 44100, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
-		mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_ENC_SIGNED_16, 0);  
+		//mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_ENC_SIGNED_16, 0);  		
 		mpg123_format_all(d->mpg123);  
 
 		d->is_mp3 = 0;
@@ -177,7 +177,8 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 		if (mpg123_open(d->mpg123, file) == MPG123_OK) {
 			d->is_mp3 = 1;
 			mpg123_getformat(d->mpg123, &d->rate, &d->nchannels, NULL);
-			d->samplesize = 2;
+			d->samplesize = mpg123_encsize(mpg123_getformat(d->mpg123, &d->rate, &d->nchannels, NULL));
+			//d->samplesize = 2;
 			d->hsize = 0;
 			d->is_raw = FALSE; 
 		}
