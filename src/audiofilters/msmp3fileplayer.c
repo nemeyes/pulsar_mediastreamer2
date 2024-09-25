@@ -166,7 +166,8 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 
 		d->mpg123 = mpg123_new(NULL, NULL);
 		mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
-		// mpg123_format_none(d->mpg123);
+		mpg123_format_none(d->mpg123);
+		mpg123_format(mh, MPG123_ANY, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_8 | MPG123_ENC_UNSIGNED_8 | MPG123_ENC_SIGNED_16 | MPG123_ENC_UNSIGNED_16 | MPG123_ENC_FLOAT_32);
 		// mpg123_format(d->mpg123, 44100, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
 		//mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_ENC_SIGNED_16, 0);  		
 		//mpg123_format_all(d->mpg123);  
