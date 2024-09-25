@@ -168,8 +168,8 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 		//mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
 		// mpg123_format_none(d->mpg123);
 		// mpg123_format(d->mpg123, 44100, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
-		mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_FORCE_FLOAT, 0); // 적절한 플래그 설정
-		mpg123_format_all(d->mpg123); // 모든 형식을 허용
+		mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_ENC_SIGNED_16, 0);  
+		mpg123_format_all(d->mpg123);  
 
 		d->is_mp3 = 0;
 		d->state = MSPlayerPaused;
