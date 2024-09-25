@@ -165,9 +165,12 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 		}
 
 		d->mpg123 = mpg123_new(NULL, NULL);
-		mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
-		mpg123_format_none(d->mpg123);
-		mpg123_format(d->mpg123, 44100, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
+		//mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
+		// mpg123_format_none(d->mpg123);
+		// mpg123_format(d->mpg123, 44100, MPG123_MONO | MPG123_STEREO, MPG123_ENC_SIGNED_16);
+		mpg123_param(d->mpg123, MPG123_ADD_FLAGS, MPG123_FORCE_FLOAT, 0); // 적절한 플래그 설정
+		mpg123_format_all(d->mpg123); // 모든 형식을 허용
+
 		d->is_mp3 = 0;
 		d->state = MSPlayerPaused;
 
@@ -499,9 +502,9 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                           {MS_MP3FILE_PLAYER_START, mp3_player_start},
                                           {MS_MP3FILE_PLAYER_STOP, mp3_player_stop},
                                           {MS_MP3FILE_PLAYER_CLOSE, mp3_player_close},
-                                        //   {MS_FILTER_GET_SAMPLE_RATE, mp3_player_get_sr},
-                                        //   {MS_FILTER_SET_SAMPLE_RATE, mp3_player_set_sr},
-                                        //   {MS_FILTER_GET_NCHANNELS, mp3_player_get_nch},
+                                           {MS_FILTER_GET_SAMPLE_RATE, mp3_player_get_sr},
+                                           {MS_FILTER_SET_SAMPLE_RATE, mp3_player_set_sr},
+                                           {MS_FILTER_GET_NCHANNELS, mp3_player_get_nch},
                                            {MS_MP3FILE_PLAYER_LOOP, mp3_player_loop},
                                            {MS_MP3FILE_PLAYER_DONE, mp3_player_eof},
 										   {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
