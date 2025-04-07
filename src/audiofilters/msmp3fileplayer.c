@@ -359,11 +359,22 @@ static void mp3_player_process(MSFilter *f) {
 						mblk_set_timestamp_info(silence_block, d->ts);
 						ms_queue_put(f->outputs[0], silence_block);   
 					}
-
-					ms_warning("MSMP3FilePlayer[%p]: fail to read MP3 data.");
-					d->state = MSPlayerPaused;
-					ms_filter_notify_no_arg(f, MS_PLAYER_EOF);
-					ms_filter_notify_no_arg(f, MS_MP3FILE_PLAYER_EOF);					 
+					
+					if (d->loop_after >= 0) {
+						if (mpg123_seek(d->mpg123, 0, SEEK_SET) >= 0) {
+						    d->ts = 0;  // 타임스탬프 초기화(원한다면)
+						} else {
+						    ms_warning("MSMP3FilePlayer[%p]: Failed to seek to beginning.", f);
+						    d->state = MSPlayerPaused;
+						    ms_filter_notify_no_arg(f, MS_PLAYER_EOF);
+						    ms_filter_notify_no_arg(f, MS_MP3FILE_PLAYER_EOF);
+						}
+					} else {
+						ms_warning("MSMP3FilePlayer[%p]: End of file reached.", f);
+						d->state = MSPlayerPaused;
+						ms_filter_notify_no_arg(f, MS_PLAYER_EOF);
+						ms_filter_notify_no_arg(f, MS_MP3FILE_PLAYER_EOF);
+					}
 				}
 			}
 		}
