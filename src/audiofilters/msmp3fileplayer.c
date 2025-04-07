@@ -365,6 +365,7 @@ static void mp3_player_process(MSFilter *f) {
 					if (d->loop_after >= 0) {
 						if (mpg123_seek(d->mpg123, 0, SEEK_SET) >= 0) {
 						    //d->ts = 0;  // 타임스탬프 초기화(원한다면)
+						    printf("d->ts[%u], d->total_samples[%u]\n", d->ts, d->total_samples);
 						    d->ts += d->total_samples;
 						} else {
 						    ms_warning("MSMP3FilePlayer[%p]: Failed to seek to beginning.", f);
