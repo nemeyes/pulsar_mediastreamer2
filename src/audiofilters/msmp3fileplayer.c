@@ -182,7 +182,7 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 			mpg123_getformat(d->mpg123, &d->rate, &d->nchannels, &encoding);			
 			d->samplesize = mpg123_encsize(encoding);
 			printf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> %d\n", d->samplesize);
-			d->total_samples = (uint32_t)mpg123_length(d->mpg123);
+			d->total_samples = 0;//(uint32_t)mpg123_length(d->mpg123);
 			//d->samplesize = 2;
 			d->hsize = 0;
 			d->is_raw = FALSE; 
@@ -365,6 +365,9 @@ static void mp3_player_process(MSFilter *f) {
 					if (d->loop_after >= 0) {
 						if (mpg123_seek(d->mpg123, 0, SEEK_SET) >= 0) {
 						    //d->ts = 0;  // 타임스탬프 초기화(원한다면)
+						    if(d->total_samples==0) {
+							d->total_samples = d->ts;
+						    }
 						    printf("d->ts[%u], d->total_samples[%u]\n", d->ts, d->total_samples);
 						    d->ts += d->total_samples;
 						} else {
