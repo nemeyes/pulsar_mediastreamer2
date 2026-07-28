@@ -29,7 +29,6 @@ struct _PlayerData {
 	int count;
 	int samplesize;
 	char *mime;
-	uint32_t total_samples;
 	uint32_t ts;
 	int async_read_too_late;
 	uint64_t current_pos_bytes;
@@ -186,7 +185,6 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 			mpg123_getformat(d->mpg123, &d->rate, &d->nchannels, &encoding);			
 			d->samplesize = mpg123_encsize(encoding);
 			printf(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> %d\n", d->samplesize);
-			d->total_samples = 0;//(uint32_t)mpg123_length(d->mpg123);
 			//d->samplesize = 2;
 			d->hsize = 0;
 			d->is_raw = FALSE;
@@ -376,20 +374,16 @@ static void mp3_player_process(MSFilter *f) {
 				}
 				if (err == MPG123_DONE) {
 
-					/* length of the file body alone, captured before any silence is added */
-					if (d->total_samples == 0) {
-						d->total_samples = d->ts;
-					}
-
 					if ( d->trail_silence_ms > 0 ) {
 						mp3_player_put_silence(f, d, d->trail_silence_ms);
 					}
 
 					if (d->loop_after >= 0) {
 						if (mpg123_seek(d->mpg123, 0, SEEK_SET) >= 0) {
-						    //d->ts = 0;  // 타임스탬프 초기화(원한다면)
-						    printf("d->ts[%u], d->total_samples[%u]\n", d->ts, d->total_samples);
-						    d->ts += d->total_samples;
+						    /* d->ts is never reset nor jumped here: it already advanced
+						       with every block that was actually sent, so the next
+						       iteration continues right where this one stopped. Any gap
+						       between iterations comes from the silence blocks alone. */
 						    /* back at the beginning of the file: lead silence is due again */
 						    d->lead_silence_pending = TRUE;
 						} else {
