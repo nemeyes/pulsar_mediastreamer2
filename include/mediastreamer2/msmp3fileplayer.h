@@ -19,7 +19,6 @@
 //  #define MS_MP3FILE_PLAYER_LOOP MS_FILTER_METHOD(MS_MP3FILE_PLAYER_ID, 4, int)
 //  #define MS_MP3FILE_PLAYER_DONE MS_FILTER_METHOD(MS_MP3FILE_PLAYER_ID, 5, int)
 //  #define MS_MP3FILE_PLAYER_BIG_BUFFER MS_FILTER_METHOD(MS_MP3FILE_PLAYER_ID, 6, int)
-//  #define MS_MP3FILE_PLAYER_SET_SILENCE MS_FILTER_METHOD(MS_MP3FILE_PLAYER_ID, 7, int)
 
 // /*events*/
 // #define MS_MP3FILE_PLAYER_EOF MS_FILTER_EVENT_NO_ARG(MS_MP3FILE_PLAYER_ID, 0)
@@ -39,7 +38,11 @@
  #define MS_MP3FILE_PLAYER_LOOP MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 4, int)
  #define MS_MP3FILE_PLAYER_DONE MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 5, int)
  #define MS_MP3FILE_PLAYER_BIG_BUFFER MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 6, int)
- #define MS_MP3FILE_PLAYER_SET_SILENCE MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 7, int)
+/* silence in milliseconds inserted before the first sample, each time playback starts
+   from the beginning of the file (open and every loop iteration) */
+ #define MS_MP3FILE_PLAYER_SET_LEAD_SILENCE MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 7, int)
+/* silence in milliseconds inserted after the last sample, at every eof and on pause */
+ #define MS_MP3FILE_PLAYER_SET_TRAIL_SILENCE MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 8, int)
 
 /*events*/
 #define MS_MP3FILE_PLAYER_EOF MS_FILTER_EVENT_NO_ARG(MSFilterMP3PlayerInterface, 0)

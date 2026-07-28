@@ -36,7 +36,9 @@ struct _PlayerData {
 	int duration;
 	bool_t swap;
 	bool_t is_raw;
-	int silence_duration_ms;
+	int lead_silence_ms;
+	int trail_silence_ms;
+	bool_t lead_silence_pending;
 
 	mpg123_handle* mpg123;
 	int is_mp3;
@@ -61,8 +63,10 @@ static void mp3_player_init(MSFilter *f) {
 	d->current_pos_bytes = 0; /* excluding wav header */
 	d->duration = 0;
 	d->is_raw = TRUE;
-	d->silence_duration_ms = 0;
- 
+	d->lead_silence_ms = 0;
+	d->trail_silence_ms = 0;
+	d->lead_silence_pending = FALSE;
+
 	f->data = d;
 }
 
@@ -185,7 +189,11 @@ static int mp3_player_open(MSFilter *f, void *arg) {
 			d->total_samples = 0;//(uint32_t)mpg123_length(d->mpg123);
 			//d->samplesize = 2;
 			d->hsize = 0;
-			d->is_raw = FALSE; 
+			d->is_raw = FALSE;
+			/* the stream sits at the beginning of the file: the lead silence is due
+			   on the first tick of playback. The duration itself is read only then,
+			   so SET_LEAD_SILENCE may be called before or after OPEN. */
+			d->lead_silence_pending = TRUE;
 		}
 		else {
 			ms_warning("MSMP3FilePlayer[%p]: failed to open MP3 file %s", f, file);
@@ -250,19 +258,28 @@ static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	return 0;
 }
 
+/* Queue a silence block of duration_ms on the output and advance the timestamp by the
+   samples it carries, so the silence takes its own slot on the timeline instead of
+   overlapping the audio that follows. */
+static void mp3_player_put_silence(MSFilter *f, PlayerData *d, int duration_ms) {
+	int silence_bytes = duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
+	int silence_samples = silence_bytes / d->samplesize;
+	mblk_t *silence_block = allocb(silence_bytes, 0);
+	memset(silence_block->b_wptr, 0, silence_bytes);
+	silence_block->b_wptr += silence_bytes;
+	mblk_set_timestamp_info(silence_block, d->ts);
+	d->ts += silence_samples;
+	ms_queue_put(f->outputs[0], silence_block);
+}
+
 static int mp3_player_pause(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	PlayerData *d = (PlayerData *)f->data;
 	ms_filter_lock(f);
 	if (d->state == MSPlayerPlaying) {
 		d->state = MSPlayerPaused;
 
-		if ( d->silence_duration_ms > 0 ) {  
-			int silence_bytes = d->silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
-			mblk_t *silence_block = allocb(silence_bytes, 0);
-			memset(silence_block->b_wptr, 0, silence_bytes);   
-			silence_block->b_wptr += silence_bytes;
-			mblk_set_timestamp_info(silence_block, d->ts);
-			ms_queue_put(f->outputs[0], silence_block);  
+		if ( d->trail_silence_ms > 0 ) {
+			mp3_player_put_silence(f, d, d->trail_silence_ms);
 		}
 
 	}
@@ -331,7 +348,13 @@ static void mp3_player_process(MSFilter *f) {
 	ms_filter_lock(f);
 	if (d->state == MSPlayerPlaying) {
 		if (d->is_mp3) {
-			size_t done = 0;			 
+			size_t done = 0;
+
+			if (d->lead_silence_pending) {
+				d->lead_silence_pending = FALSE;
+				if (d->lead_silence_ms > 0) mp3_player_put_silence(f, d, d->lead_silence_ms);
+			}
+
 			mblk_t* om = allocb(bytes, 0);
 		/*	if (d->pause_time > 0) {
 				err = bytes;
@@ -353,23 +376,22 @@ static void mp3_player_process(MSFilter *f) {
 				}
 				if (err == MPG123_DONE) {
 
-					if ( d->silence_duration_ms > 0 ) {  
-						int silence_bytes = d->silence_duration_ms * d->rate * d->nchannels * d->samplesize / 1000;
-						mblk_t *silence_block = allocb(silence_bytes, 0);
-						memset(silence_block->b_wptr, 0, silence_bytes);   
-						silence_block->b_wptr += silence_bytes;
-						mblk_set_timestamp_info(silence_block, d->ts);
-						ms_queue_put(f->outputs[0], silence_block);   
+					/* length of the file body alone, captured before any silence is added */
+					if (d->total_samples == 0) {
+						d->total_samples = d->ts;
 					}
-					
+
+					if ( d->trail_silence_ms > 0 ) {
+						mp3_player_put_silence(f, d, d->trail_silence_ms);
+					}
+
 					if (d->loop_after >= 0) {
 						if (mpg123_seek(d->mpg123, 0, SEEK_SET) >= 0) {
 						    //d->ts = 0;  // 타임스탬프 초기화(원한다면)
-						    if(d->total_samples==0) {
-							d->total_samples = d->ts;
-						    }
 						    printf("d->ts[%u], d->total_samples[%u]\n", d->ts, d->total_samples);
 						    d->ts += d->total_samples;
+						    /* back at the beginning of the file: lead silence is due again */
+						    d->lead_silence_pending = TRUE;
 						} else {
 						    ms_warning("MSMP3FilePlayer[%p]: Failed to seek to beginning.", f);
 						    d->state = MSPlayerPaused;
@@ -451,9 +473,15 @@ static int mp3_player_loop(MSFilter *f, void *arg) {
 	return 0;
 }
 
-static int mp3_player_set_silence(MSFilter *f, void *arg) {	
+static int mp3_player_set_lead_silence(MSFilter *f, void *arg) {
 	PlayerData *d = (PlayerData *)f->data;
-	d->silence_duration_ms= *((int *)arg);
+	d->lead_silence_ms = *((int *)arg);
+	return 0;
+}
+
+static int mp3_player_set_trail_silence(MSFilter *f, void *arg) {
+	PlayerData *d = (PlayerData *)f->data;
+	d->trail_silence_ms = *((int *)arg);
 	return 0;
 }
 
@@ -529,7 +557,8 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
                                            {MS_FILTER_GET_NCHANNELS, mp3_player_get_nch},
                                            {MS_MP3FILE_PLAYER_LOOP, mp3_player_loop},
                                            {MS_MP3FILE_PLAYER_DONE, mp3_player_eof},
-										   {MS_MP3FILE_PLAYER_SET_SILENCE, mp3_player_set_silence},
+										   {MS_MP3FILE_PLAYER_SET_LEAD_SILENCE, mp3_player_set_lead_silence},
+										   {MS_MP3FILE_PLAYER_SET_TRAIL_SILENCE, mp3_player_set_trail_silence},
                                            {MS_PLAYER_GET_DURATION, mp3_player_get_duration},
                                            {MS_PLAYER_GET_CURRENT_POSITION, mp3_player_get_current_position},
                                            {MS_PLAYER_SEEK_MS, mp3_player_seek_position},
