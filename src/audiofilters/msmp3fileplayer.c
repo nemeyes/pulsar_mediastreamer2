@@ -25,6 +25,10 @@
 #define MP3_MAX_DECODES_PER_TICK 64
 /* How many bytes mpg123 may search for a frame before giving up on a stream. */
 #define MP3_RESYNC_LIMIT 65536
+/* Length of the ramp applied where the waveform would otherwise step: when playback is cut
+   at an arbitrary amplitude, and when it picks up again from silence. Without it both ends
+   click. Short enough not to be heard as a fade, long enough to remove the step. */
+#define MP3_FADE_MS 8
 
 static int mp3_player_close(MSFilter *f, void *arg);
 static int mp3_player_open_playlist(MSFilter *f, void *arg);
@@ -63,6 +67,16 @@ struct _PlayerData {
 	int cur_track;
 	int tracks_duration_ms; /* sum of the tracks, silences excluded */
 	bool_t finished; /* last track exhausted; the trail may still be draining */
+	/* What to do once the outro below has been played out. Pause keeps the queued audio so
+	   that resuming carries on where it left off; stop throws it away. */
+	enum { MP3_OUTRO_NONE = 0, MP3_OUTRO_PAUSE, MP3_OUTRO_STOP } outro;
+	/* Fade-out plus trail, emitted ahead of anything still queued: it belongs to the moment
+	   playback was interrupted, not after whatever had been decoded in advance. */
+	MSBufferizer *outro_bz;
+	int16_t last_frame[2]; /* last frame emitted, so the fade-out starts where it left off */
+	bool_t have_last_frame;
+	int fade_in_frames; /* frames of fade-in still to apply */
+	int fade_in_total;
 
 	/* Native format of the track being decoded. Differs from rate/nchannels when the
 	   playlist mixes formats, in which case the samples are converted on the way out. */
@@ -107,6 +121,11 @@ static void mp3_player_init(MSFilter *f) {
 	d->cur_track = 0;
 	d->tracks_duration_ms = 0;
 	d->finished = FALSE;
+	d->outro = MP3_OUTRO_NONE;
+	d->outro_bz = ms_bufferizer_new();
+	d->have_last_frame = FALSE;
+	d->fade_in_frames = 0;
+	d->fade_in_total = 0;
 	d->track_rate = 0;
 	d->track_nchannels = 0;
 	d->resampler = NULL;
@@ -407,6 +426,71 @@ static void mp3_put_silence(PlayerData *d, int ms) {
 	ms_bufferizer_put(d->bz, m);
 }
 
+/* Frames in a MP3_FADE_MS ramp at the output rate. */
+static int mp3_fade_frames(PlayerData *d) {
+	return (d->rate * MP3_FADE_MS) / 1000;
+}
+
+/* Queue the outro: a ramp from wherever the waveform was left down to zero, followed by the
+   trail silence. Both go to their own bufferizer, which process() drains ahead of the audio
+   still queued - the interruption happens now, not after the samples decoded in advance. */
+static void mp3_put_outro(PlayerData *d) {
+	int frames = mp3_fade_frames(d);
+	int i, c;
+	mblk_t *m;
+	int16_t *out;
+
+	if (d->have_last_frame && frames > 0) {
+		m = allocb((size_t)frames * d->samplesize * d->nchannels, 0);
+		out = (int16_t *)m->b_wptr;
+		for (i = 0; i < frames; i++) {
+			int scale = frames - 1 - i; /* frames-1 .. 0 */
+			for (c = 0; c < d->nchannels; c++) {
+				out[i * d->nchannels + c] = (int16_t)(((int32_t)d->last_frame[c] * scale) / frames);
+			}
+		}
+		m->b_wptr += (size_t)frames * d->samplesize * d->nchannels;
+		ms_bufferizer_put(d->outro_bz, m);
+	}
+	if (d->trail_silence_ms > 0) {
+		int n = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
+		if (n > 0) {
+			m = allocb((size_t)n, 0);
+			memset(m->b_wptr, 0, (size_t)n);
+			m->b_wptr += n;
+			ms_bufferizer_put(d->outro_bz, m);
+		}
+	}
+}
+
+/* Ramp the start of a block up from zero. Playback resuming, or starting after a silence,
+   otherwise jumps straight to whatever amplitude the waveform happens to be at. */
+static void mp3_apply_fade_in(PlayerData *d, uint8_t *data, int bytes) {
+	int frames = bytes / (d->samplesize * d->nchannels);
+	int16_t *s = (int16_t *)data;
+	int i, c;
+
+	for (i = 0; i < frames && d->fade_in_frames > 0; i++) {
+		int scale = d->fade_in_total - d->fade_in_frames; /* 0 .. total-1 */
+		for (c = 0; c < d->nchannels; c++) {
+			s[i * d->nchannels + c] = (int16_t)(((int32_t)s[i * d->nchannels + c] * scale) / d->fade_in_total);
+		}
+		d->fade_in_frames--;
+	}
+}
+
+/* Remember the last frame of a block so a later fade-out can pick up from it. */
+static void mp3_remember_last_frame(PlayerData *d, const uint8_t *data, int bytes) {
+	int frames = bytes / (d->samplesize * d->nchannels);
+	const int16_t *s = (const int16_t *)data;
+	int c;
+	if (frames <= 0) return;
+	for (c = 0; c < d->nchannels && c < 2; c++) {
+		d->last_frame[c] = s[(frames - 1) * d->nchannels + c];
+	}
+	d->have_last_frame = TRUE;
+}
+
 /* Decode one chunk, convert it to the output format and hand it to the bufferizer. Returns
    0 when something was added, -1 when nothing could be (end of track is handled here).
    Decoding is kept separate from the tick output because resampling does not preserve the
@@ -642,44 +726,83 @@ fail:
 
 static int mp3_player_start(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	PlayerData *d = (PlayerData *)f->data;
-	if (d->state == MSPlayerPaused) d->state = MSPlayerPlaying;
-	return 0;
-}
-
-/* Rewind to the head of the playlist. No silence is emitted: the lead is only re-armed, so
-   that it plays before the first sample whenever playback starts again. */
-static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
-	PlayerData *d = (PlayerData *)f->data;
 	ms_filter_lock(f);
-	if (d->state != MSPlayerClosed) {
-		d->state = MSPlayerPaused;
-		d->finished = FALSE;
-		ms_bufferizer_flush(d->bz);
-		if (d->is_mp3 && d->ntracks > 0) {
-			if (mp3_rewind_playlist(f, d) == 0) {
-				d->lead_silence_pending = TRUE;
-			} else {
-				ms_warning("MSMP3FilePlayer[%p]: failed to rewind to the first track.", f);
-			}
-		}
-		if (d->reader) {
-			ms_async_reader_seek(d->reader, d->hsize);
-			d->current_pos_bytes = 0;
-		}
+	if (d->state == MSPlayerPaused) {
+		d->state = MSPlayerPlaying;
+		/* Coming back from silence: ramp in, or the first samples step straight to whatever
+		   amplitude the waveform was at and that clicks. */
+		d->fade_in_total = mp3_fade_frames(d);
+		d->fade_in_frames = d->fade_in_total;
 	}
 	ms_filter_unlock(f);
 	return 0;
 }
 
-/* Freeze where we are. Neither the lead nor the trail is involved: the lead is a "we are at
-   the head of the playlist" flag, already spent, and the trail belongs to the end of the last
-   track only. Whatever is queued in the bufferizer stays there, so pausing in the middle
-   of a gap resumes with the remainder of that gap. */
+/* Go idle at the head of the playlist. The lead is re-armed so that it plays before the
+   first sample whenever playback starts again; no silence is emitted here. */
+static void mp3_player_go_idle(MSFilter *f, PlayerData *d) {
+	d->state = MSPlayerPaused;
+	d->outro = MP3_OUTRO_NONE;
+	d->finished = FALSE;
+	ms_bufferizer_flush(d->bz);
+	ms_bufferizer_flush(d->outro_bz);
+	d->have_last_frame = FALSE;
+	if (d->is_mp3 && d->ntracks > 0) {
+		if (mp3_rewind_playlist(f, d) == 0) {
+			d->lead_silence_pending = TRUE;
+		} else {
+			ms_warning("MSMP3FilePlayer[%p]: failed to rewind to the first track.", f);
+		}
+	}
+	if (d->reader) {
+		ms_async_reader_seek(d->reader, d->hsize);
+		d->current_pos_bytes = 0;
+	}
+}
+
+/* Stop playing. When a trail is configured and we were actually playing, it is emitted
+   first: whatever audio is still queued is dropped - this is a stop, not the end of the
+   track - and the trail is queued in its place. Playback ends once process() has played it
+   out, so the caller must not tear the graph down before MS_PLAYER_GET_STATE stops
+   reporting MSPlayerPlaying. With no trail configured this goes idle immediately, exactly
+   as it did before. */
+static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
+	PlayerData *d = (PlayerData *)f->data;
+	ms_filter_lock(f);
+	if (d->state == MSPlayerPlaying && d->is_mp3) {
+		/* stopping, not finishing: the audio decoded ahead is dropped */
+		ms_bufferizer_flush(d->bz);
+		ms_bufferizer_flush(d->outro_bz);
+		mp3_put_outro(d);
+		d->finished = FALSE;
+		d->outro = MP3_OUTRO_STOP;
+		if (ms_bufferizer_get_avail(d->outro_bz) == 0) mp3_player_go_idle(f, d);
+	} else if (d->state != MSPlayerClosed) {
+		mp3_player_go_idle(f, d);
+	}
+	ms_filter_unlock(f);
+	return 0;
+}
+
+/* Freeze where we are, after playing out the outro - a ramp down to zero, then the trail.
+   The audio still queued is kept, not dropped, so resuming carries on from the very sample
+   it left off at; pausing in the middle of a gap likewise resumes with the rest of that gap.
+   The lead is not involved: it marks the head of the playlist and was spent long ago.
+   Playback only stops once the outro has been emitted, so a caller that tears the graph
+   down on pause must wait for MS_PLAYER_GET_STATE to stop reporting MSPlayerPlaying. */
 static int mp3_player_pause(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	PlayerData *d = (PlayerData *)f->data;
 	ms_filter_lock(f);
 	if (d->state == MSPlayerPlaying) {
-		d->state = MSPlayerPaused;
+		if (d->is_mp3) {
+			ms_bufferizer_flush(d->outro_bz);
+			mp3_put_outro(d);
+			d->outro = MP3_OUTRO_PAUSE;
+		}
+		if (!d->is_mp3 || ms_bufferizer_get_avail(d->outro_bz) == 0) {
+			d->outro = MP3_OUTRO_NONE;
+			d->state = MSPlayerPaused;
+		}
 	}
 	ms_filter_unlock(f);
 	return 0;
@@ -702,6 +825,10 @@ static int mp3_player_close(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	d->is_mp3 = 0;
 	d->lead_silence_pending = FALSE;
 	d->finished = FALSE;
+	d->outro = MP3_OUTRO_NONE;
+	ms_bufferizer_flush(d->outro_bz);
+	d->have_last_frame = FALSE;
+	d->fade_in_frames = 0;
 	d->track_rate = 0;
 	d->track_nchannels = 0;
 
@@ -731,6 +858,10 @@ static void mp3_player_uninit(MSFilter *f) {
 	if (d->bz) {
 		ms_bufferizer_destroy(d->bz);
 		d->bz = NULL;
+	}
+	if (d->outro_bz) {
+		ms_bufferizer_destroy(d->outro_bz);
+		d->outro_bz = NULL;
 	}
 	ms_free(d);
 }
@@ -773,8 +904,19 @@ static void mp3_player_process(MSFilter *f) {
 
 			while (filled < bytes) {
 				size_t want = (size_t)(bytes - filled);
-				size_t avail = ms_bufferizer_get_avail(d->bz);
+				size_t outro_avail = ms_bufferizer_get_avail(d->outro_bz);
+				size_t avail;
 
+				/* The outro goes first: it belongs to the moment playback was interrupted,
+				   ahead of anything decoded in advance. */
+				if (outro_avail > 0) {
+					size_t n = (outro_avail >= want) ? want : outro_avail;
+					filled += (int)ms_bufferizer_read(d->outro_bz, om->b_wptr + filled, n);
+					continue;
+				}
+				if (d->outro != MP3_OUTRO_NONE) break; /* outro done, stop filling */
+
+				avail = ms_bufferizer_get_avail(d->bz);
 				/* ms_bufferizer_read is all or nothing: never ask for more than it holds */
 				if (avail >= want) {
 					filled += (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, want);
@@ -789,7 +931,8 @@ static void mp3_player_process(MSFilter *f) {
 					mp3_fill_bufferizer(f, d);
 					continue;
 				}
-				/* End of the playlist: flush the remainder, even a partial tick of it */
+				/* Playing out the last of it - the end of the playlist, or the trail of a
+				   stop - so flush the remainder, even a partial tick of it */
 				if (avail > 0) {
 					filled += (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, avail);
 					continue;
@@ -798,6 +941,8 @@ static void mp3_player_process(MSFilter *f) {
 			}
 
 			if (filled > 0) {
+				if (d->fade_in_frames > 0) mp3_apply_fade_in(d, om->b_wptr, filled);
+				mp3_remember_last_frame(d, om->b_wptr, filled);
 				om->b_wptr += filled;
 				mblk_set_timestamp_info(om, d->ts);
 				/* advance by what was really produced: on the last block of a track the
@@ -808,10 +953,22 @@ static void mp3_player_process(MSFilter *f) {
 				freemsg(om);
 			}
 
+			/* The outro has now been played out. No end-of-playlist event either way: the
+			   caller asked for this, it is not the track finishing. */
+			if (d->outro != MP3_OUTRO_NONE && ms_bufferizer_get_avail(d->outro_bz) == 0) {
+				if (d->outro == MP3_OUTRO_PAUSE) {
+					/* keep the queued audio: resuming carries on from that very sample */
+					d->outro = MP3_OUTRO_NONE;
+					d->state = MSPlayerPaused;
+					d->have_last_frame = FALSE;
+				} else {
+					mp3_player_go_idle(f, d);
+				}
+			}
 			/* Report the end only once the trail has been fully emitted and the bufferizer
 			   has run dry. The consumer tears the graph down on this event, so notifying
 			   early would cut off whatever is still queued. */
-			if (d->finished && ms_bufferizer_get_avail(d->bz) == 0) {
+			else if (d->finished && ms_bufferizer_get_avail(d->bz) == 0) {
 				if (d->loop_after >= 0 && mp3_rewind_playlist(f, d) == 0) {
 					/* d->ts is never reset nor jumped: it advanced with every block actually
 					   sent, so the next iteration carries on where this one stopped. The
