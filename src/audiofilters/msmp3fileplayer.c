@@ -25,9 +25,10 @@
 #define MP3_MAX_DECODES_PER_TICK 64
 /* How many bytes mpg123 may search for a frame before giving up on a stream. */
 #define MP3_RESYNC_LIMIT 65536
-/* Length of the ramp applied where the waveform would otherwise step: when playback is cut
-   at an arbitrary amplitude, and when it picks up again from silence. Without it both ends
-   click. Short enough not to be heard as a fade, long enough to remove the step. */
+/* Default length of the ramp applied where the waveform would otherwise step: when playback
+   is cut at an arbitrary amplitude, and when it picks up again from silence. Without it both
+   ends click. Short enough not to be heard as a fade, long enough to remove the step.
+   Overridable per direction with SET_FADE_IN / SET_FADE_OUT. */
 #define MP3_FADE_MS 8
 
 static int mp3_player_close(MSFilter *f, void *arg);
@@ -75,6 +76,8 @@ struct _PlayerData {
 	MSBufferizer *outro_bz;
 	int16_t last_frame[2]; /* last frame emitted, so the fade-out starts where it left off */
 	bool_t have_last_frame;
+	int fade_in_ms;
+	int fade_out_ms;
 	int fade_in_frames; /* frames of fade-in still to apply */
 	int fade_in_total;
 
@@ -124,6 +127,8 @@ static void mp3_player_init(MSFilter *f) {
 	d->outro = MP3_OUTRO_NONE;
 	d->outro_bz = ms_bufferizer_new();
 	d->have_last_frame = FALSE;
+	d->fade_in_ms = MP3_FADE_MS;
+	d->fade_out_ms = MP3_FADE_MS;
 	d->fade_in_frames = 0;
 	d->fade_in_total = 0;
 	d->track_rate = 0;
@@ -426,16 +431,17 @@ static void mp3_put_silence(PlayerData *d, int ms) {
 	ms_bufferizer_put(d->bz, m);
 }
 
-/* Frames in a MP3_FADE_MS ramp at the output rate. */
-static int mp3_fade_frames(PlayerData *d) {
-	return (d->rate * MP3_FADE_MS) / 1000;
+/* Frames in a ramp of 'ms' at the output rate. */
+static int mp3_fade_frames(PlayerData *d, int ms) {
+	if (ms <= 0 || d->rate <= 0) return 0;
+	return (int)(((int64_t)d->rate * (int64_t)ms) / 1000LL);
 }
 
 /* Queue the outro: a ramp from wherever the waveform was left down to zero, followed by the
    trail silence. Both go to their own bufferizer, which process() drains ahead of the audio
    still queued - the interruption happens now, not after the samples decoded in advance. */
 static void mp3_put_outro(PlayerData *d) {
-	int frames = mp3_fade_frames(d);
+	int frames = mp3_fade_frames(d, d->fade_out_ms);
 	int i, c;
 	mblk_t *m;
 	int16_t *out;
@@ -731,7 +737,7 @@ static int mp3_player_start(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 		d->state = MSPlayerPlaying;
 		/* Coming back from silence: ramp in, or the first samples step straight to whatever
 		   amplitude the waveform was at and that clicks. */
-		d->fade_in_total = mp3_fade_frames(d);
+		d->fade_in_total = mp3_fade_frames(d, d->fade_in_ms);
 		d->fade_in_frames = d->fade_in_total;
 	}
 	ms_filter_unlock(f);
@@ -1053,22 +1059,55 @@ static int mp3_player_loop(MSFilter *f, void *arg) {
 	return 0;
 }
 
+/* Keep a duration inside the range the filter supports, and say so rather than silently
+   doing something else than what was asked. */
+static int mp3_clamp_ms(MSFilter *f, const char *what, int ms, int lo, int hi) {
+	if (ms < lo) {
+		ms_warning("MSMP3FilePlayer[%p]: %s of %i ms is below %i, clamped", f, what, ms, lo);
+		return lo;
+	}
+	if (ms > hi) {
+		ms_warning("MSMP3FilePlayer[%p]: %s of %i ms is above %i, clamped", f, what, ms, hi);
+		return hi;
+	}
+	return ms;
+}
+
 static int mp3_player_set_lead_silence(MSFilter *f, void *arg) {
 	PlayerData *d = (PlayerData *)f->data;
-	d->lead_silence_ms = *((int *)arg);
+	d->lead_silence_ms = mp3_clamp_ms(f, "lead silence", *((int *)arg), MS_MP3FILE_PLAYER_SILENCE_MIN_MS,
+	                                  MS_MP3FILE_PLAYER_SILENCE_MAX_MS);
 	return 0;
 }
 
 static int mp3_player_set_trail_silence(MSFilter *f, void *arg) {
 	PlayerData *d = (PlayerData *)f->data;
-	d->trail_silence_ms = *((int *)arg);
+	d->trail_silence_ms = mp3_clamp_ms(f, "trail silence", *((int *)arg), MS_MP3FILE_PLAYER_SILENCE_MIN_MS,
+	                                   MS_MP3FILE_PLAYER_SILENCE_MAX_MS);
+	return 0;
+}
+
+/* Length of the ramp playback fades in over when it resumes. 0 disables it. */
+static int mp3_player_set_fade_in(MSFilter *f, void *arg) {
+	PlayerData *d = (PlayerData *)f->data;
+	d->fade_in_ms = mp3_clamp_ms(f, "fade in", *((int *)arg), MS_MP3FILE_PLAYER_FADE_MIN_MS,
+	                             MS_MP3FILE_PLAYER_FADE_MAX_MS);
+	return 0;
+}
+
+/* Length of the ramp playback fades out over when paused or stopped. 0 disables it. */
+static int mp3_player_set_fade_out(MSFilter *f, void *arg) {
+	PlayerData *d = (PlayerData *)f->data;
+	d->fade_out_ms = mp3_clamp_ms(f, "fade out", *((int *)arg), MS_MP3FILE_PLAYER_FADE_MIN_MS,
+	                              MS_MP3FILE_PLAYER_FADE_MAX_MS);
 	return 0;
 }
 
 /* Applies from the next track boundary on; a gap already in flight is left alone. */
 static int mp3_player_set_gap_silence(MSFilter *f, void *arg) {
 	PlayerData *d = (PlayerData *)f->data;
-	d->gap_silence_ms = *((int *)arg);
+	d->gap_silence_ms = mp3_clamp_ms(f, "gap silence", *((int *)arg), MS_MP3FILE_PLAYER_SILENCE_MIN_MS,
+	                                 MS_MP3FILE_PLAYER_SILENCE_MAX_MS);
 	return 0;
 }
 
@@ -1189,6 +1228,8 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
 										   {MS_MP3FILE_PLAYER_SET_LEAD_SILENCE, mp3_player_set_lead_silence},
 										   {MS_MP3FILE_PLAYER_SET_TRAIL_SILENCE, mp3_player_set_trail_silence},
 										   {MS_MP3FILE_PLAYER_SET_GAP_SILENCE, mp3_player_set_gap_silence},
+										   {MS_MP3FILE_PLAYER_SET_FADE_IN, mp3_player_set_fade_in},
+										   {MS_MP3FILE_PLAYER_SET_FADE_OUT, mp3_player_set_fade_out},
                                            {MS_PLAYER_GET_DURATION, mp3_player_get_duration},
                                            {MS_PLAYER_GET_CURRENT_POSITION, mp3_player_get_current_position},
                                            {MS_PLAYER_SEEK_MS, mp3_player_seek_position},

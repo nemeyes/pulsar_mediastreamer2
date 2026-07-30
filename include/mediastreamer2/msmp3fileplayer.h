@@ -46,6 +46,16 @@
    reaches eof. Never inserted on pause/stop, nor between tracks. */
  #define MS_MP3FILE_PLAYER_SET_TRAIL_SILENCE MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 8, int)
 
+/* Accepted range for the silences and the fades, in milliseconds. A value outside the range
+   is clamped to it, and logged; the call still succeeds. 0 means "none".
+   The silence ceiling is what keeps one block from growing unreasonably - at 48kHz stereo
+   the maximum is already some 5.8 MB - and the fade ceiling keeps a stop from taking that
+   much longer to complete. Both are far above anything either is useful for. */
+#define MS_MP3FILE_PLAYER_SILENCE_MIN_MS 0
+#define MS_MP3FILE_PLAYER_SILENCE_MAX_MS 30000
+#define MS_MP3FILE_PLAYER_FADE_MIN_MS 0
+#define MS_MP3FILE_PLAYER_FADE_MAX_MS 5000
+
 /* A playlist of files played back-to-back as a single, continuous stream.
    'files' holds 'nfiles' paths; the filter copies them, the caller keeps ownership. */
 typedef struct _MSMP3PlaylistDesc {
@@ -75,6 +85,15 @@ typedef struct _MSMP3PlaylistStatus {
 } MSMP3PlaylistStatus;
 
  #define MS_MP3FILE_PLAYER_GET_TRACK_STATUS MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 13, MSMP3PlaylistStatus)
+
+/* Length in milliseconds of the ramps applied where the waveform would otherwise step, and
+   click: playback resuming from silence fades in, playback being paused or stopped fades
+   out. 0 disables one of them. Both default to 8 ms.
+   The fade-in only scales samples that were going out anyway, so it costs nothing; the
+   fade-out is generated after the last sample, so it makes the stream that much longer and
+   delays the moment a stop completes. */
+ #define MS_MP3FILE_PLAYER_SET_FADE_IN MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 14, int)
+ #define MS_MP3FILE_PLAYER_SET_FADE_OUT MS_FILTER_METHOD(MSFilterMP3PlayerInterface, 15, int)
 
 /* Native format of a track, as reported by TRACK_FORMAT_CHANGED. */
 typedef struct _MSMP3TrackFormat {
