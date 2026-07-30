@@ -12,9 +12,17 @@
 
 #include <limits.h>
 #include <mpg123.h>
+#include <speex/speex_resampler.h>
 
 
 #include "fd_portab.h" // keep this include at the end of the inclusion sequence.
+
+/* One decode step. Big enough to cover a tick at any MP3 rate with room to spare, small
+   enough that the conversion below stays on a couple of cache lines' worth of work. */
+#define MP3_DECODE_CHUNK 4096
+/* Upper bound on decode steps per tick. One is normally enough; more are only needed when
+   several very short tracks end back to back. Also keeps the loop from spinning. */
+#define MP3_MAX_DECODES_PER_TICK 64
 
 static int mp3_player_close(MSFilter *f, void *arg);
 static int mp3_player_open_playlist(MSFilter *f, void *arg);
@@ -23,6 +31,8 @@ struct _PlayerData {
 	bctbx_vfs_file_t *fp;
 	MSAsyncReader *reader;
 	MSPlayerState state;
+	/* Output format. Taken from the first playable track and immutable from then on, so the
+	   downstream resampler stays valid for the whole playlist. */
 	int rate;
 	int nchannels;
 	int hsize;
@@ -44,8 +54,10 @@ struct _PlayerData {
 
 	/* playlist: the filter plays 'ntracks' files back-to-back as one continuous stream.
 	   A single file is just the ntracks==1 case, it takes the very same code path. */
-	char **tracks;
+	char **tracks;   /* the caller's list, kept whole so indices stay comparable */
+	bool_t *kept;    /* tracks[i] could be opened and will be played */
 	int ntracks;
+	int nkept;
 	int cur_track;
 	int tracks_duration_ms; /* sum of the tracks, silences excluded */
 	/* silence still owed to the output, drained at most one tick at a time. Holds the lead,
@@ -53,6 +65,15 @@ struct _PlayerData {
 	   differs, never the way they are emitted. */
 	int silence_remaining_bytes;
 	bool_t finished; /* last track exhausted; the trail may still be draining */
+
+	/* Native format of the track being decoded. Differs from rate/nchannels when the
+	   playlist mixes formats, in which case the samples are converted on the way out. */
+	int track_rate;
+	int track_nchannels;
+	SpeexResamplerState *resampler; /* only while track_rate != rate */
+	MSBufferizer *bz;               /* normalized PCM, drained one tick at a time */
+	uint8_t scratch[MP3_DECODE_CHUNK];
+	bool_t probing; /* opening the playlist: do not raise track events yet */
 
 	mpg123_handle* mpg123;
 	int is_mp3;
@@ -82,11 +103,18 @@ static void mp3_player_init(MSFilter *f) {
 	d->gap_silence_ms = 0;
 	d->lead_silence_pending = FALSE;
 	d->tracks = NULL;
+	d->kept = NULL;
 	d->ntracks = 0;
+	d->nkept = 0;
 	d->cur_track = 0;
 	d->tracks_duration_ms = 0;
 	d->silence_remaining_bytes = 0;
 	d->finished = FALSE;
+	d->track_rate = 0;
+	d->track_nchannels = 0;
+	d->resampler = NULL;
+	d->bz = ms_bufferizer_new();
+	d->probing = FALSE;
 
 	f->data = d;
 }
@@ -182,7 +210,12 @@ static void mp3_playlist_free(PlayerData *d) {
 		ms_free(d->tracks);
 		d->tracks = NULL;
 	}
+	if (d->kept) {
+		ms_free(d->kept);
+		d->kept = NULL;
+	}
 	d->ntracks = 0;
+	d->nkept = 0;
 	d->cur_track = 0;
 	d->tracks_duration_ms = 0;
 }
@@ -212,11 +245,99 @@ static int mp3_silence_bytes_from_ms(PlayerData *d, int ms) {
 	return (int)(b - (b % frame));
 }
 
-/* Make 'index' the current track. Every track but the first must match the format of the
-   first one: the resampler downstream is configured once, when the graph is built. */
+/* Drop the resampler, and build a new one when the track being decoded does not already
+   match the output format. speex_resampler is a fixed-ratio converter, so the input rate is
+   baked into the handle: a track with a different rate needs a new one. */
+static void mp3_setup_resampler(MSFilter *f, PlayerData *d) {
+	int err = 0;
+
+	if (d->resampler) {
+		speex_resampler_destroy(d->resampler);
+		d->resampler = NULL;
+	}
+	if (d->track_rate == d->rate || d->track_rate <= 0 || d->nchannels <= 0) return;
+
+	/* Channels are adapted before resampling, so this always works on the output layout. */
+	d->resampler = speex_resampler_init((spx_uint32_t)d->nchannels, (spx_uint32_t)d->track_rate,
+	                                    (spx_uint32_t)d->rate, SPEEX_RESAMPLER_QUALITY_VOIP, &err);
+	if (d->resampler == NULL) {
+		ms_error("MSMP3FilePlayer[%p]: cannot resample %iHz to %iHz (error %i)", f, d->track_rate, d->rate,
+		         err);
+	} else {
+		ms_message("MSMP3FilePlayer[%p]: track %i resampled %iHz -> %iHz", f, d->cur_track, d->track_rate,
+		           d->rate);
+	}
+}
+
+/* Copy the first input channel into every output channel, the convention msresample uses,
+   so a mixed playlist behaves the way the graph itself would have. */
+static void mp3_adapt_channels(PlayerData *d, const int16_t *in, int inframes, int16_t *out) {
+	int i, c;
+	for (i = 0; i < inframes; i++) {
+		for (c = 0; c < d->nchannels; c++) {
+			out[i * d->nchannels + c] = in[i * d->track_nchannels];
+		}
+	}
+}
+
+/* Turn one decoded chunk into output-format PCM, or NULL when there is nothing to emit.
+   A track that already matches the output format is copied verbatim, so a same-format
+   playlist produces byte-identical audio. */
+static mblk_t *mp3_normalize(PlayerData *d, const uint8_t *in, size_t inbytes) {
+	int inframes = (int)(inbytes / (size_t)(d->samplesize * d->track_nchannels));
+	mblk_t *chan = NULL;
+	const int16_t *rate_in;
+	mblk_t *om;
+	spx_uint32_t inlen, outlen;
+
+	if (inframes <= 0) return NULL;
+
+	if (d->track_nchannels != d->nchannels) {
+		chan = allocb((size_t)inframes * d->samplesize * d->nchannels, 0);
+		mp3_adapt_channels(d, (const int16_t *)in, inframes, (int16_t *)chan->b_wptr);
+		chan->b_wptr += (size_t)inframes * d->samplesize * d->nchannels;
+		rate_in = (const int16_t *)chan->b_rptr;
+	} else {
+		rate_in = (const int16_t *)in;
+	}
+
+	if (d->resampler == NULL) {
+		if (chan) return chan; /* channels adapted, rate was already right */
+		om = allocb(inbytes, 0);
+		memcpy(om->b_wptr, in, inbytes);
+		om->b_wptr += inbytes;
+		return om;
+	}
+
+	/* One frame of slack: the ratio rarely divides evenly and speex carries a fractional
+	   remainder between calls. */
+	outlen = (spx_uint32_t)(((int64_t)inframes * d->rate) / d->track_rate + 1);
+	om = allocb((size_t)outlen * d->samplesize * d->nchannels, 0);
+	inlen = (spx_uint32_t)inframes;
+	if (d->nchannels == 1) {
+		speex_resampler_process_int(d->resampler, 0, (const spx_int16_t *)rate_in, &inlen,
+		                            (spx_int16_t *)om->b_wptr, &outlen);
+	} else {
+		speex_resampler_process_interleaved_int(d->resampler, (const spx_int16_t *)rate_in, &inlen,
+		                                        (spx_int16_t *)om->b_wptr, &outlen);
+	}
+	om->b_wptr += (size_t)outlen * d->samplesize * d->nchannels;
+	if (chan) freemsg(chan);
+	if (outlen == 0) {
+		freemsg(om);
+		return NULL;
+	}
+	return om;
+}
+
+/* Make 'index' the track being decoded. Any MP3 rate/channel combination is accepted: the
+   output format was fixed by the first playable track and samples are converted to it. */
 static int mp3_open_track(MSFilter *f, PlayerData *d, int index) {
 	long rate = 0;
 	int ch = 0, enc = 0;
+	int had_format = (d->track_rate > 0);
+	int prev_rate = d->track_rate;
+	int prev_nchannels = d->track_nchannels;
 
 	if (d->mpg123 == NULL || index < 0 || index >= d->ntracks) return -1;
 
@@ -230,29 +351,89 @@ static int mp3_open_track(MSFilter *f, PlayerData *d, int index) {
 		mpg123_close(d->mpg123);
 		return -1;
 	}
-	if (index > 0 && ((int)rate != d->rate || ch != d->nchannels)) {
-		ms_error("MSMP3FilePlayer[%p]: track %i (%s) is %liHz/%ich, expected %iHz/%ich", f, index,
-		         d->tracks[index], rate, ch, d->rate, d->nchannels);
-		mpg123_close(d->mpg123);
-		return -1;
-	}
-	d->rate = (int)rate;
-	d->nchannels = ch;
+
+	d->track_rate = (int)rate;
+	d->track_nchannels = ch;
 	d->samplesize = mpg123_encsize(enc);
 	d->cur_track = index;
+
+	if (d->rate <= 0 || d->nchannels <= 0) {
+		/* the first playable track sets the output format for the whole playlist */
+		d->rate = d->track_rate;
+		d->nchannels = d->track_nchannels;
+	}
+	mp3_setup_resampler(f, d);
+
+	/* Report a change of source format, but never while the playlist is being probed: that
+	   pass opens every track and would fire once per entry before playback even starts. */
+	if (!d->probing && had_format &&
+	    (d->track_rate != prev_rate || d->track_nchannels != prev_nchannels)) {
+		MSMP3TrackFormat fmt;
+		fmt.index = index;
+		fmt.rate = d->track_rate;
+		fmt.nchannels = d->track_nchannels;
+		ms_filter_notify(f, MS_MP3FILE_PLAYER_TRACK_FORMAT_CHANGED, &fmt);
+	}
 	return 0;
 }
 
 /* Move on to the next playable track. Returns 0 on success, -1 once the playlist is over.
-   A track that cannot be opened anymore (deleted since the playlist was validated) is
-   skipped rather than aborting the whole playback. */
+   Entries dropped when the playlist was opened are stepped over, and one that has become
+   unreadable since is skipped rather than aborting the whole playback. */
 static int mp3_advance_track(MSFilter *f, PlayerData *d) {
 	int i;
 	for (i = d->cur_track + 1; i < d->ntracks; i++) {
+		if (d->kept && !d->kept[i]) continue;
 		if (mp3_open_track(f, d, i) == 0) return 0;
 		ms_error("MSMP3FilePlayer[%p]: skipping track %i", f, i);
 	}
 	return -1;
+}
+
+/* Go back to the first playable track. Used to restart a loop and to rewind on stop. */
+static int mp3_rewind_playlist(MSFilter *f, PlayerData *d) {
+	d->cur_track = -1;
+	return mp3_advance_track(f, d);
+}
+
+/* Decode one chunk, convert it to the output format and hand it to the bufferizer. Returns
+   0 when audio was added, -1 when it could not be (end of track is handled here).
+   Decoding is kept separate from the tick output because resampling does not preserve the
+   sample count: there is no way to know up front how much to read to fill one tick. */
+static int mp3_fill_bufferizer(MSFilter *f, PlayerData *d) {
+	size_t done = 0;
+	int err = mpg123_read(d->mpg123, d->scratch, sizeof(d->scratch), &done);
+
+	if (done > 0) {
+		mblk_t *m = mp3_normalize(d, d->scratch, done);
+		if (m) ms_bufferizer_put(d->bz, m);
+	}
+
+	if (err == MPG123_DONE) {
+		if (mp3_advance_track(f, d) == 0) {
+			/* An inner boundary. The gap is armed here and nowhere else, so it can never
+			   land before the first track or after the last one. */
+			if (d->gap_silence_ms > 0) {
+				d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->gap_silence_ms);
+			}
+		} else {
+			/* that was the last track: the trail belongs here, and only here */
+			if (d->trail_silence_ms > 0) {
+				d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
+			}
+			d->finished = TRUE;
+		}
+		return -1;
+	}
+	if (err != MPG123_OK && err != MPG123_NEW_FORMAT) {
+		ms_warning("MSMP3FilePlayer[%p]: failed to read track %i (error %i).", f, d->cur_track, err);
+		if (d->trail_silence_ms > 0) {
+			d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
+		}
+		d->finished = TRUE;
+		return -1;
+	}
+	return (done > 0) ? 0 : -1;
 }
 
 static int mp3_player_open(MSFilter *f, void *arg) {
@@ -338,7 +519,16 @@ static int mp3_player_open_playlist(MSFilter *f, void *arg) {
 		d->mpg123 = NULL;
 	}
 	mp3_playlist_free(d);
+	ms_bufferizer_flush(d->bz);
+	if (d->resampler) {
+		speex_resampler_destroy(d->resampler);
+		d->resampler = NULL;
+	}
 	d->is_mp3 = 0;
+	d->rate = 0; /* the first playable track decides the output format */
+	d->nchannels = 0;
+	d->track_rate = 0;
+	d->track_nchannels = 0;
 
 	d->mpg123 = mpg123_new(NULL, NULL);
 	if (d->mpg123 == NULL) {
@@ -350,27 +540,55 @@ static int mp3_player_open_playlist(MSFilter *f, void *arg) {
 	mp3_setup_format(d->mpg123);
 
 	d->tracks = ms_new0(char *, pl->nfiles);
+	d->kept = ms_new0(bool_t, pl->nfiles);
 	d->ntracks = pl->nfiles;
 	for (i = 0; i < d->ntracks; i++) {
 		if (pl->files[i] == NULL || pl->files[i][0] == '\0') {
 			ms_error("MSMP3FilePlayer[%p]: playlist entry %i is empty", f, i);
-			goto fail;
+			continue; /* leaves kept[i] false */
 		}
 		d->tracks[i] = ms_strdup(pl->files[i]);
+		d->kept[i] = TRUE;
 	}
 
-	/* Validate the whole playlist up front: every track must be readable and share the
-	   format of the first one. Doing it here means a bad playlist is rejected before the
-	   graph runs, rather than in the middle of playback on the ticker thread. It also
-	   warms the page cache, which keeps the mid-playback track switches cheap. */
+	/* Probe the whole playlist up front. A track that cannot be opened is dropped here
+	   rather than in the middle of playback on the ticker thread, and the pass warms the
+	   page cache, which keeps the mid-playback switches cheap. Tracks may differ in format:
+	   the first playable one sets the output format and the rest are converted to it. */
+	d->probing = TRUE;
 	for (i = 0; i < d->ntracks; i++) {
 		off_t len;
-		if (mp3_open_track(f, d, i) != 0) goto fail;
+		if (!d->kept[i]) continue;
+		if (mp3_open_track(f, d, i) != 0) {
+			ms_error("MSMP3FilePlayer[%p]: dropping track %i (%s)", f, i, d->tracks[i]);
+			d->kept[i] = FALSE;
+			continue;
+		}
+		d->nkept++;
+		if (d->track_rate != d->rate || d->track_nchannels != d->nchannels) {
+			ms_message("MSMP3FilePlayer[%p]: track %i is %iHz/%ich, will be converted to %iHz/%ich", f, i,
+			           d->track_rate, d->track_nchannels, d->rate, d->nchannels);
+		}
 		len = mpg123_length(d->mpg123);
-		if (len > 0 && d->rate > 0) total_ms += (int)((1000LL * (int64_t)len) / (int64_t)d->rate);
+		if (len > 0 && d->track_rate > 0) {
+			total_ms += (int)((1000LL * (int64_t)len) / (int64_t)d->track_rate);
+		}
+	}
+	if (d->nkept == 0) {
+		d->probing = FALSE;
+		ms_error("MSMP3FilePlayer[%p]: no playable track in the playlist", f);
+		goto fail;
 	}
 
-	if (mp3_open_track(f, d, 0) != 0) goto fail;
+	/* Rewind to the first track that survived the probe. Still under 'probing': the format
+	   we come back to differs from the last one probed whenever the list is mixed, and that
+	   is not a change the caller should hear about. */
+	d->cur_track = -1;
+	if (mp3_advance_track(f, d) != 0) {
+		d->probing = FALSE;
+		goto fail;
+	}
+	d->probing = FALSE;
 
 	d->is_mp3 = 1;
 	d->is_raw = FALSE;
@@ -418,8 +636,9 @@ static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 		d->state = MSPlayerPaused;
 		d->silence_remaining_bytes = 0; /* a gap or trail in flight is dropped */
 		d->finished = FALSE;
+		ms_bufferizer_flush(d->bz);
 		if (d->is_mp3 && d->ntracks > 0) {
-			if (mp3_open_track(f, d, 0) == 0) {
+			if (mp3_rewind_playlist(f, d) == 0) {
 				d->lead_silence_pending = TRUE;
 			} else {
 				ms_warning("MSMP3FilePlayer[%p]: failed to rewind to the first track.", f);
@@ -457,10 +676,17 @@ static int mp3_player_close(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 		d->mpg123 = NULL;
 	}
 	mp3_playlist_free(d);
+	if (d->resampler) {
+		speex_resampler_destroy(d->resampler);
+		d->resampler = NULL;
+	}
+	ms_bufferizer_flush(d->bz);
 	d->is_mp3 = 0;
 	d->silence_remaining_bytes = 0;
 	d->lead_silence_pending = FALSE;
 	d->finished = FALSE;
+	d->track_rate = 0;
+	d->track_nchannels = 0;
 
 	if (d->reader) {
 		ms_async_reader_destroy(d->reader);
@@ -485,6 +711,10 @@ static int mp3_player_get_state(MSFilter *f, void *arg) {
 static void mp3_player_uninit(MSFilter *f) {
 	PlayerData *d = (PlayerData *)f->data;
 	mp3_player_close(f, NULL);
+	if (d->bz) {
+		ms_bufferizer_destroy(d->bz);
+		d->bz = NULL;
+	}
 	ms_free(d);
 }
 
@@ -521,6 +751,7 @@ static void mp3_player_process(MSFilter *f) {
 			   line a track boundary up with a block boundary. */
 			mblk_t *om = allocb(bytes, 0);
 			int filled = 0;
+			int decodes = 0;
 
 			while (filled < bytes) {
 				/* (1) drain the pending silence, whichever one it is */
@@ -532,8 +763,8 @@ static void mp3_player_process(MSFilter *f) {
 					d->silence_remaining_bytes -= n;
 					continue;
 				}
-				/* (2) last track exhausted and its trail already out */
-				if (d->finished) break;
+				/* (2) last track exhausted, trail out, and nothing left in the bufferizer */
+				if (d->finished && ms_bufferizer_get_avail(d->bz) == 0) break;
 				/* (3) head of the playlist: the lead is due, once */
 				if (d->lead_silence_pending) {
 					d->lead_silence_pending = FALSE;
@@ -542,36 +773,20 @@ static void mp3_player_process(MSFilter *f) {
 						continue;
 					}
 				}
-				/* (4) audio */
-				{
-					size_t done = 0;
-					int err = mpg123_read(d->mpg123, om->b_wptr + filled, bytes - filled, &done);
-					filled += (int)done;
-					if (err == MPG123_DONE) {
-						/* A track just ended. If another one follows, this is an inner
-						   boundary: arm the gap and keep filling. The gap is armed here and
-						   nowhere else, so it can never land before the first track or after
-						   the last one. */
-						if (mp3_advance_track(f, d) == 0) {
-							if (d->gap_silence_ms > 0) {
-								d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->gap_silence_ms);
-							}
-							continue;
-						}
-						/* that was the last track: the trail belongs here, and only here */
-						if (d->trail_silence_ms > 0) {
-							d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
-						}
-						d->finished = TRUE;
-						continue;
-					}
-					if (err != MPG123_OK && err != MPG123_NEW_FORMAT) {
-						ms_warning("MSMP3FilePlayer[%p]: failed to read track %i (error %i).", f, d->cur_track, err);
-						d->finished = TRUE;
-						continue;
-					}
-					if (done == 0) break; /* nothing more to be had this tick */
+				/* (4) normalized PCM, taken from the bufferizer */
+				if (ms_bufferizer_get_avail(d->bz) > 0) {
+					int n = (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, (size_t)(bytes - filled));
+					if (n <= 0) break;
+					filled += n;
+					continue;
 				}
+				if (d->finished) break;
+				/* (5) bufferizer is dry: decode and convert one more chunk. Track switches,
+				   gap and trail are all handled in there. The counter bounds the work a
+				   single tick may do, and stops the loop from spinning should the decoder
+				   keep returning nothing without reaching the end of the track. */
+				if (++decodes > MP3_MAX_DECODES_PER_TICK) break;
+				if (mp3_fill_bufferizer(f, d) != 0) continue;
 			}
 
 			if (filled > 0) {
@@ -585,10 +800,11 @@ static void mp3_player_process(MSFilter *f) {
 				freemsg(om);
 			}
 
-			/* Report the end only once the trail has been fully emitted. The consumer tears
-			   the graph down on this event, so notifying earlier would cut the trail off. */
-			if (d->finished && d->silence_remaining_bytes == 0) {
-				if (d->loop_after >= 0 && mp3_open_track(f, d, 0) == 0) {
+			/* Report the end only once the trail has been fully emitted and the bufferizer
+			   has run dry. The consumer tears the graph down on this event, so notifying
+			   early would cut off whatever is still queued. */
+			if (d->finished && d->silence_remaining_bytes == 0 && ms_bufferizer_get_avail(d->bz) == 0) {
+				if (d->loop_after >= 0 && mp3_rewind_playlist(f, d) == 0) {
 					/* d->ts is never reset nor jumped: it advanced with every block actually
 					   sent, so the next iteration carries on where this one stopped. The
 					   space between iterations comes from the silences alone. */
@@ -691,9 +907,28 @@ static int mp3_player_set_gap_silence(MSFilter *f, void *arg) {
 	return 0;
 }
 
+/* Tracks that will actually play, i.e. excluding the ones dropped when opening. */
 static int mp3_player_get_track_count(MSFilter *f, void *arg) {
 	PlayerData *d = (PlayerData *)f->data;
-	*((int *)arg) = d->ntracks;
+	*((int *)arg) = d->nkept;
+	return 0;
+}
+
+/* Fill the caller's array with the per-track outcome of the last OPEN_PLAYLIST, indexed
+   like the list it passed in, so it can report exactly which entries were dropped. */
+static int mp3_player_get_track_status(MSFilter *f, void *arg) {
+	PlayerData *d = (PlayerData *)f->data;
+	MSMP3PlaylistStatus *st = (MSMP3PlaylistStatus *)arg;
+	int i;
+
+	if (st == NULL || st->status == NULL || st->nfiles < d->ntracks) {
+		ms_error("MSMP3FilePlayer[%p]: GET_TRACK_STATUS needs an array of %i entries", f, d->ntracks);
+		return -1;
+	}
+	for (i = 0; i < d->ntracks; i++) {
+		st->status[i] = (d->kept && d->kept[i]) ? 1 : 0;
+	}
+	st->nfiles = d->ntracks;
 	return 0;
 }
 
@@ -785,6 +1020,7 @@ static MSFilterMethod mp3_player_methods[] = {{MS_MP3FILE_PLAYER_OPEN, mp3_playe
 										   {MS_MP3FILE_PLAYER_OPEN_PLAYLIST, mp3_player_open_playlist},
 										   {MS_MP3FILE_PLAYER_GET_TRACK_COUNT, mp3_player_get_track_count},
 										   {MS_MP3FILE_PLAYER_GET_CUR_TRACK, mp3_player_get_cur_track},
+										   {MS_MP3FILE_PLAYER_GET_TRACK_STATUS, mp3_player_get_track_status},
 										   {MS_MP3FILE_PLAYER_SET_LEAD_SILENCE, mp3_player_set_lead_silence},
 										   {MS_MP3FILE_PLAYER_SET_TRAIL_SILENCE, mp3_player_set_trail_silence},
 										   {MS_MP3FILE_PLAYER_SET_GAP_SILENCE, mp3_player_set_gap_silence},
