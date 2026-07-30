@@ -60,10 +60,6 @@ struct _PlayerData {
 	int nkept;
 	int cur_track;
 	int tracks_duration_ms; /* sum of the tracks, silences excluded */
-	/* silence still owed to the output, drained at most one tick at a time. Holds the lead,
-	   a track-to-track gap or the trail indifferently: only the moment they are armed
-	   differs, never the way they are emitted. */
-	int silence_remaining_bytes;
 	bool_t finished; /* last track exhausted; the trail may still be draining */
 
 	/* Native format of the track being decoded. Differs from rate/nchannels when the
@@ -108,7 +104,6 @@ static void mp3_player_init(MSFilter *f) {
 	d->nkept = 0;
 	d->cur_track = 0;
 	d->tracks_duration_ms = 0;
-	d->silence_remaining_bytes = 0;
 	d->finished = FALSE;
 	d->track_rate = 0;
 	d->track_nchannels = 0;
@@ -396,14 +391,38 @@ static int mp3_rewind_playlist(MSFilter *f, PlayerData *d) {
 	return mp3_advance_track(f, d);
 }
 
+/* Queue a silence of 'ms'. It goes through the bufferizer like the audio does, which is what
+   keeps the two in the right order - a gap must follow the last samples of the track it
+   comes after, not overtake them - and what paces it, since the output only ever takes one
+   tick's worth per tick. */
+static void mp3_put_silence(PlayerData *d, int ms) {
+	int n = mp3_silence_bytes_from_ms(d, ms);
+	mblk_t *m;
+	if (n <= 0) return;
+	m = allocb((size_t)n, 0);
+	memset(m->b_wptr, 0, (size_t)n);
+	m->b_wptr += n;
+	ms_bufferizer_put(d->bz, m);
+}
+
 /* Decode one chunk, convert it to the output format and hand it to the bufferizer. Returns
-   0 when audio was added, -1 when it could not be (end of track is handled here).
+   0 when something was added, -1 when nothing could be (end of track is handled here).
    Decoding is kept separate from the tick output because resampling does not preserve the
    sample count: there is no way to know up front how much to read to fill one tick. */
 static int mp3_fill_bufferizer(MSFilter *f, PlayerData *d) {
 	size_t done = 0;
-	int err = mpg123_read(d->mpg123, d->scratch, sizeof(d->scratch), &done);
+	int err;
 
+	/* The head of the playlist: the lead is due before the first sample, once. */
+	if (d->lead_silence_pending) {
+		d->lead_silence_pending = FALSE;
+		if (d->lead_silence_ms > 0) {
+			mp3_put_silence(d, d->lead_silence_ms);
+			return 0;
+		}
+	}
+
+	err = mpg123_read(d->mpg123, d->scratch, sizeof(d->scratch), &done);
 	if (done > 0) {
 		mblk_t *m = mp3_normalize(d, d->scratch, done);
 		if (m) ms_bufferizer_put(d->bz, m);
@@ -411,27 +430,21 @@ static int mp3_fill_bufferizer(MSFilter *f, PlayerData *d) {
 
 	if (err == MPG123_DONE) {
 		if (mp3_advance_track(f, d) == 0) {
-			/* An inner boundary. The gap is armed here and nowhere else, so it can never
+			/* An inner boundary. The gap is queued here and nowhere else, so it can never
 			   land before the first track or after the last one. */
-			if (d->gap_silence_ms > 0) {
-				d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->gap_silence_ms);
-			}
+			if (d->gap_silence_ms > 0) mp3_put_silence(d, d->gap_silence_ms);
 		} else {
 			/* that was the last track: the trail belongs here, and only here */
-			if (d->trail_silence_ms > 0) {
-				d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
-			}
+			if (d->trail_silence_ms > 0) mp3_put_silence(d, d->trail_silence_ms);
 			d->finished = TRUE;
 		}
-		return -1;
+		return 0;
 	}
 	if (err != MPG123_OK && err != MPG123_NEW_FORMAT) {
 		ms_warning("MSMP3FilePlayer[%p]: failed to read track %i (error %i).", f, d->cur_track, err);
-		if (d->trail_silence_ms > 0) {
-			d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->trail_silence_ms);
-		}
+		if (d->trail_silence_ms > 0) mp3_put_silence(d, d->trail_silence_ms);
 		d->finished = TRUE;
-		return -1;
+		return 0;
 	}
 	return (done > 0) ? 0 : -1;
 }
@@ -600,7 +613,6 @@ static int mp3_player_open_playlist(MSFilter *f, void *arg) {
 	   SET_LEAD_SILENCE works whether it is called before or after this, and that resuming
 	   from a pause never re-inserts it. */
 	d->lead_silence_pending = TRUE;
-	d->silence_remaining_bytes = 0;
 	d->finished = FALSE;
 
 	ms_filter_unlock(f);
@@ -634,7 +646,6 @@ static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	ms_filter_lock(f);
 	if (d->state != MSPlayerClosed) {
 		d->state = MSPlayerPaused;
-		d->silence_remaining_bytes = 0; /* a gap or trail in flight is dropped */
 		d->finished = FALSE;
 		ms_bufferizer_flush(d->bz);
 		if (d->is_mp3 && d->ntracks > 0) {
@@ -655,8 +666,8 @@ static int mp3_player_stop(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 
 /* Freeze where we are. Neither the lead nor the trail is involved: the lead is a "we are at
    the head of the playlist" flag, already spent, and the trail belongs to the end of the last
-   track only. silence_remaining_bytes is kept as is, so pausing in the middle of a gap
-   resumes with the remainder of that gap. */
+   track only. Whatever is queued in the bufferizer stays there, so pausing in the middle
+   of a gap resumes with the remainder of that gap. */
 static int mp3_player_pause(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	PlayerData *d = (PlayerData *)f->data;
 	ms_filter_lock(f);
@@ -682,7 +693,6 @@ static int mp3_player_close(MSFilter *f, BCTBX_UNUSED(void *arg)) {
 	}
 	ms_bufferizer_flush(d->bz);
 	d->is_mp3 = 0;
-	d->silence_remaining_bytes = 0;
 	d->lead_silence_pending = FALSE;
 	d->finished = FALSE;
 	d->track_rate = 0;
@@ -745,48 +755,39 @@ static void mp3_player_process(MSFilter *f) {
 	ms_filter_lock(f);
 	if (d->state == MSPlayerPlaying) {
 		if (d->is_mp3) {
-			/* Fill exactly one tick worth of output, taking from the pending silence, from
-			   the current track, and - when it ends - from the next one, in that order. The
-			   whole playlist is emitted as one continuous PCM stream: nothing here has to
-			   line a track boundary up with a block boundary. */
+			/* Fill exactly one tick of output from the bufferizer, decoding more whenever it
+			   runs short. Silence and audio both travel through the bufferizer, so their order
+			   is simply the order they were queued in, and the whole playlist comes out as one
+			   continuous stream: nothing here has to line a track boundary up with a block
+			   boundary. */
 			mblk_t *om = allocb(bytes, 0);
 			int filled = 0;
 			int decodes = 0;
 
 			while (filled < bytes) {
-				/* (1) drain the pending silence, whichever one it is */
-				if (d->silence_remaining_bytes > 0) {
-					int n = bytes - filled;
-					if (n > d->silence_remaining_bytes) n = d->silence_remaining_bytes;
-					memset(om->b_wptr + filled, 0, n);
-					filled += n;
-					d->silence_remaining_bytes -= n;
+				size_t want = (size_t)(bytes - filled);
+				size_t avail = ms_bufferizer_get_avail(d->bz);
+
+				/* ms_bufferizer_read is all or nothing: never ask for more than it holds */
+				if (avail >= want) {
+					filled += (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, want);
 					continue;
 				}
-				/* (2) last track exhausted, trail out, and nothing left in the bufferizer */
-				if (d->finished && ms_bufferizer_get_avail(d->bz) == 0) break;
-				/* (3) head of the playlist: the lead is due, once */
-				if (d->lead_silence_pending) {
-					d->lead_silence_pending = FALSE;
-					if (d->lead_silence_ms > 0) {
-						d->silence_remaining_bytes = mp3_silence_bytes_from_ms(d, d->lead_silence_ms);
-						continue;
-					}
-				}
-				/* (4) normalized PCM, taken from the bufferizer */
-				if (ms_bufferizer_get_avail(d->bz) > 0) {
-					int n = (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, (size_t)(bytes - filled));
-					if (n <= 0) break;
-					filled += n;
+				if (!d->finished) {
+					/* Short: decode and convert another chunk. The lead, track switches, gap
+					   and trail are all queued in there. The counter bounds the work one tick
+					   may do and stops the loop from spinning should the decoder keep returning
+					   nothing without reaching the end of the track. */
+					if (++decodes > MP3_MAX_DECODES_PER_TICK) break;
+					mp3_fill_bufferizer(f, d);
 					continue;
 				}
-				if (d->finished) break;
-				/* (5) bufferizer is dry: decode and convert one more chunk. Track switches,
-				   gap and trail are all handled in there. The counter bounds the work a
-				   single tick may do, and stops the loop from spinning should the decoder
-				   keep returning nothing without reaching the end of the track. */
-				if (++decodes > MP3_MAX_DECODES_PER_TICK) break;
-				if (mp3_fill_bufferizer(f, d) != 0) continue;
+				/* End of the playlist: flush the remainder, even a partial tick of it */
+				if (avail > 0) {
+					filled += (int)ms_bufferizer_read(d->bz, om->b_wptr + filled, avail);
+					continue;
+				}
+				break;
 			}
 
 			if (filled > 0) {
@@ -803,7 +804,7 @@ static void mp3_player_process(MSFilter *f) {
 			/* Report the end only once the trail has been fully emitted and the bufferizer
 			   has run dry. The consumer tears the graph down on this event, so notifying
 			   early would cut off whatever is still queued. */
-			if (d->finished && d->silence_remaining_bytes == 0 && ms_bufferizer_get_avail(d->bz) == 0) {
+			if (d->finished && ms_bufferizer_get_avail(d->bz) == 0) {
 				if (d->loop_after >= 0 && mp3_rewind_playlist(f, d) == 0) {
 					/* d->ts is never reset nor jumped: it advanced with every block actually
 					   sent, so the next iteration carries on where this one stopped. The
