@@ -23,6 +23,8 @@
 /* Upper bound on decode steps per tick. One is normally enough; more are only needed when
    several very short tracks end back to back. Also keeps the loop from spinning. */
 #define MP3_MAX_DECODES_PER_TICK 64
+/* How many bytes mpg123 may search for a frame before giving up on a stream. */
+#define MP3_RESYNC_LIMIT 65536
 
 static int mp3_player_close(MSFilter *f, void *arg);
 static int mp3_player_open_playlist(MSFilter *f, void *arg);
@@ -549,7 +551,12 @@ static int mp3_player_open_playlist(MSFilter *f, void *arg) {
 		ms_filter_unlock(f);
 		return -1;
 	}
-	mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, -1, 0);
+	/* How far to look for a frame when parsing fails. A negative value means "to the end of
+	   the stream", which turns a file that is not an MP3 at all into a full read before it
+	   is finally rejected - and that read happens while opening the playlist. A finite limit
+	   caps that; per mpg123 this can only enlarge the built-in junk-skipping window, never
+	   reduce it, so well-formed files are unaffected. */
+	mpg123_param(d->mpg123, MPG123_RESYNC_LIMIT, MP3_RESYNC_LIMIT, 0);
 	mp3_setup_format(d->mpg123);
 
 	d->tracks = ms_new0(char *, pl->nfiles);
